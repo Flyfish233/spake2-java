@@ -315,6 +315,7 @@ public class Spake2Context implements Destroyable, AutoCloseable {
      */
     public byte[] processMessage(final byte[] theirMsg) throws IllegalArgumentException, IllegalStateException {
         byte[] dhShared = null;
+        boolean success = false;
         try {
             if (isDestroyed) throw new IllegalStateException("The context was destroyed.");
             if (this.state != State.MsgGenerated) {
@@ -381,12 +382,16 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             byte[] result = key.clone();
             Arrays.fill(key, (byte) 0);
             this.state = State.KeyGenerated;
+            success = true;
             return result;
         } finally {
             if (dhShared != null) {
                 Arrays.fill(dhShared, (byte) 0);
             }
             wipeSensitiveState();
+            if (!success) {
+                isDestroyed = true;
+            }
         }
     }
 
@@ -475,20 +480,15 @@ public class Spake2Context implements Destroyable, AutoCloseable {
 
         /**
          * Conditional move (constant-time byte-wise).
-         * Place into this = mask ? whenTrue : whenFalse
+         * Place into this = (mask != 0) ? whenTrue : whenFalse
          */
         public void conditionalCopyFrom(Scalar whenTrue, Scalar whenFalse, long mask) {
-            int maskInt = (int) mask;
-            for (int i = 0; i < 8; ++i) {
-                int idx = i * 4;
-                for (int j = 0; j < 4; ++j) {
-                    int shift = j * 8;
-                    int m = (maskInt >>> shift) & 0xFF;
-                    int nm = (~m) & 0xFF;
-                    int a = whenTrue.bytes[idx + j] & 0xFF;
-                    int b = whenFalse.bytes[idx + j] & 0xFF;
-                    this.bytes[idx + j] = (byte) ((m & a) | (nm & b));
-                }
+            long nonZero = (mask | -mask) >>> 63; // 1 if mask != 0, else 0
+            int m = (int) -nonZero;               // 0xFFFFFFFF when mask != 0, else 0x00000000
+            for (int i = 0; i < 32; ++i) {
+                int a = whenTrue.bytes[i] & 0xFF;
+                int b = whenFalse.bytes[i] & 0xFF;
+                this.bytes[i] = (byte) ((m & a) | (~m & b));
             }
         }
 
