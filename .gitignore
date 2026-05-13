@@ -2,3 +2,9 @@
 .gradle/
 .DS_Store
 build/
+CONTINUITY.md
+PLAN.md
+DOCUMENTATION.md
+SPEC.md
+.audit-cache/
+tmp/
