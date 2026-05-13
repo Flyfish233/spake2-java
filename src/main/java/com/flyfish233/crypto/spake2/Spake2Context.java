@@ -12,6 +12,7 @@ import cafe.cryptography.curve25519.Constants;
 import cafe.cryptography.curve25519.EdwardsPoint;
 import cafe.cryptography.curve25519.InvalidEncodingException;
 import cafe.cryptography.ed25519.Ed25519PublicKey;
+import cafe.cryptography.subtle.ConstantTime;
 
 import javax.security.auth.Destroyable;
 import java.security.MessageDigest;
@@ -46,6 +47,7 @@ public class Spake2Context implements Destroyable, AutoCloseable {
     public static final int MAX_PASSWORD_SIZE = 65536; // 64 KiB
     private static final byte[] M_POINT_ENCODED = HexUtils.hexToBytes("5ada7e4bf6ddd9adb6626d32131c6b5c51a1e347a3478f53cfcf441b88eed12e");
     private static final byte[] N_POINT_ENCODED = HexUtils.hexToBytes("10e3df0ae37d8e7a99b5fe74b44672103dbddcbd06af680d71329a11693bc778");
+    private static final byte[] GROUP_ORDER = HexUtils.hexToBytes("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
 
     private static final EdwardsPoint LIB_M;
     private static final EdwardsPoint LIB_N;
@@ -69,9 +71,10 @@ public class Spake2Context implements Destroyable, AutoCloseable {
     /**
      * Randomness source that drives ephemeral key generation and other random values required by the protocol.
      */
-    private final SecureRandom secureRandom; // 可注入随机源
+    private final SecureRandom secureRandom; // Injectable for deterministic protocol tests.
 
     private State state;
+    private boolean disablePasswordScalarHack = false;
     private boolean isDestroyed = false;
 
     /**
@@ -119,6 +122,14 @@ public class Spake2Context implements Destroyable, AutoCloseable {
         this.secureRandom = rng != null ? rng : SecureRandomHolder.INSTANCE;
     }
 
+    public void setDisablePasswordScalarHack(boolean disablePasswordScalarHack) {
+        this.disablePasswordScalarHack = disablePasswordScalarHack;
+    }
+
+    public boolean isDisablePasswordScalarHack() {
+        return disablePasswordScalarHack;
+    }
+
     /**
      * Multiplies {@code n} by eight by performing a three bit left shift.
      *
@@ -135,6 +146,85 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             n[i] = (byte) ((n[i] << 3) | carry);
             carry = next_carry;
         }
+    }
+
+    /**
+     * Applies the BoringSSL/AOSP password scalar hardening that clears the low
+     * three bits by adding multiples of the subgroup order without changing the
+     * effective mask in the prime-order subgroup.
+     */
+    private byte[] hardenPasswordScalar(byte[] reducedPasswordScalar) {
+        Scalar passwordScalar = new Scalar(reducedPasswordScalar);
+        Scalar order = new Scalar(GROUP_ORDER);
+        Scalar tmp = new Scalar();
+        try {
+            if (!disablePasswordScalarHack) {
+                // Match BoringSSL's compatibility hack: add l, 2*l, and 4*l
+                // according to the low three bits instead of reducing again.
+                tmp.reset();
+                tmp.conditionalCopyFrom(order, tmp, ConstantTime.equal(passwordScalar.getByte(0) & 1, 1));
+                passwordScalar.addInPlace(tmp);
+                order.dblInPlace();
+
+                tmp.reset();
+                tmp.conditionalCopyFrom(order, tmp, ConstantTime.equal(passwordScalar.getByte(0) & 2, 2));
+                passwordScalar.addInPlace(tmp);
+                order.dblInPlace();
+
+                tmp.reset();
+                tmp.conditionalCopyFrom(order, tmp, ConstantTime.equal(passwordScalar.getByte(0) & 4, 4));
+                passwordScalar.addInPlace(tmp);
+            }
+            return passwordScalar.getBytes().clone();
+        } finally {
+            passwordScalar.reset();
+            order.reset();
+            tmp.reset();
+        }
+    }
+
+    /**
+     * Multiplies an Edwards point by a raw 256-bit little-endian scalar without
+     * canonicalizing the top bit. This preserves the full `leftShift3` result
+     * that BoringSSL/AOSP use when clearing the cofactor.
+     */
+    private static EdwardsPoint multiplyByRawScalar(EdwardsPoint point, byte[] scalar) {
+        if (scalar.length != 32) {
+            throw new IllegalArgumentException("Scalar must be 32 bytes.");
+        }
+        EdwardsPoint[] table = new EdwardsPoint[16];
+        table[0] = EdwardsPoint.IDENTITY;
+        for (int i = 1; i < table.length; ++i) {
+            table[i] = table[i - 1].add(point);
+        }
+
+        EdwardsPoint result = EdwardsPoint.IDENTITY;
+        for (int byteIndex = 31; byteIndex >= 0; --byteIndex) {
+            int value = scalar[byteIndex] & 0xFF;
+            // Process the little-endian scalar from most-significant nibble to
+            // least-significant nibble so bit 255 remains part of the scalar.
+            result = multiplyBy16(result);
+            result = result.add(selectPoint(table, (value >>> 4) & 0x0F));
+            result = multiplyBy16(result);
+            result = result.add(selectPoint(table, value & 0x0F));
+        }
+        return result;
+    }
+
+    private static EdwardsPoint multiplyBy16(EdwardsPoint point) {
+        EdwardsPoint result = point;
+        for (int i = 0; i < 4; ++i) {
+            result = result.dbl();
+        }
+        return result;
+    }
+
+    private static EdwardsPoint selectPoint(EdwardsPoint[] table, int digit) {
+        EdwardsPoint selected = table[0];
+        for (int i = 1; i < table.length; ++i) {
+            selected = selected.ctSelect(table[i], ConstantTime.equal(digit, i));
+        }
+        return selected;
     }
 
     private static void updateWithLengthPrefix(MessageDigest sha, final byte[] data, int len) {
@@ -264,16 +354,19 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             leftShift3(reducedPrivate);
             System.arraycopy(reducedPrivate, 0, this.privateKey, 0, this.privateKey.length);
 
-            final cafe.cryptography.curve25519.Scalar nativePrivateScalar =
-                    cafe.cryptography.curve25519.Scalar.fromBits(this.privateKey);
-            final EdwardsPoint nativeP = Constants.ED25519_BASEPOINT.multiply(nativePrivateScalar);
+            final EdwardsPoint nativeP = multiplyByRawScalar(Constants.ED25519_BASEPOINT, this.privateKey);
 
             byte[] passwordTmp = getHash(password); // 64 bytes
             try {
                 System.arraycopy(passwordTmp, 0, this.passwordHash, 0, this.passwordHash.length);
                 byte[] reduced = cafe.cryptography.curve25519.Scalar.fromBytesModOrderWide(passwordTmp).toByteArray();
                 try {
-                    System.arraycopy(reduced, 0, this.passwordScalar, 0, this.passwordScalar.length);
+                    byte[] hardened = hardenPasswordScalar(reduced);
+                    try {
+                        System.arraycopy(hardened, 0, this.passwordScalar, 0, this.passwordScalar.length);
+                    } finally {
+                        Arrays.fill(hardened, (byte) 0);
+                    }
                 } finally {
                     Arrays.fill(reduced, (byte) 0);
                 }
@@ -282,9 +375,7 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             }
 
             EdwardsPoint nativeMaskBase = this.myRole == Spake2Role.Alice ? LIB_M : LIB_N;
-            cafe.cryptography.curve25519.Scalar nativePasswordScalar =
-                    cafe.cryptography.curve25519.Scalar.fromBytesModOrder(this.passwordScalar);
-            EdwardsPoint nativeMask = nativeMaskBase.multiply(nativePasswordScalar);
+            EdwardsPoint nativeMask = multiplyByRawScalar(nativeMaskBase, this.passwordScalar);
             EdwardsPoint nativePStar = nativeP.add(nativeMask);
 
             byte[] encoded = nativePStar.compress().toByteArray();
@@ -315,6 +406,7 @@ public class Spake2Context implements Destroyable, AutoCloseable {
      */
     public byte[] processMessage(final byte[] theirMsg) throws IllegalArgumentException, IllegalStateException {
         byte[] dhShared = null;
+        byte[] peerMsg = null;
         boolean success = false;
         try {
             if (isDestroyed) throw new IllegalStateException("The context was destroyed.");
@@ -324,56 +416,36 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             if (theirMsg == null || theirMsg.length != MAX_MSG_SIZE) {
                 throw new IllegalArgumentException("Invalid peer message.");
             }
+            // The dependency wrappers may retain byte-array references, so copy
+            // network input before validation and transcript hashing.
+            peerMsg = theirMsg.clone();
             try {
-                Ed25519PublicKey.fromByteArray(theirMsg);
+                Ed25519PublicKey.fromByteArray(peerMsg);
             } catch (InvalidEncodingException e) {
                 throw new IllegalArgumentException("Point received from peer was not on the curve.", e);
             }
             EdwardsPoint nativeQStar;
             try {
-                nativeQStar = new CompressedEdwardsY(theirMsg).decompress();
+                nativeQStar = new CompressedEdwardsY(peerMsg).decompress();
             } catch (InvalidEncodingException e) {
                 throw new IllegalArgumentException("Point received from peer was not on the curve.", e);
             }
             EdwardsPoint nativePeersMaskBase = this.myRole == Spake2Role.Alice ? LIB_N : LIB_M;
-            cafe.cryptography.curve25519.Scalar nativePasswordScalar =
-                    cafe.cryptography.curve25519.Scalar.fromBytesModOrder(this.passwordScalar);
-            EdwardsPoint nativePeersMask = nativePeersMaskBase.multiply(nativePasswordScalar);
+            EdwardsPoint nativePeersMask = multiplyByRawScalar(nativePeersMaskBase, this.passwordScalar);
             EdwardsPoint nativeQExt = nativeQStar.subtract(nativePeersMask);
-            // Check if 8*Q == 0
-            EdwardsPoint q8 = nativeQExt;
-            q8 = q8.add(q8); // 2Q
-            q8 = q8.add(q8); // 4Q
-            q8 = q8.add(q8); // 8Q
-            byte[] q8enc = q8.compress().toByteArray();
-            try {
-                if (q8enc.length == 32 && q8enc[0] == 0x01) {
-                    boolean allZero = true;
-                    for (int i = 1; i < 32; ++i) {
-                        if (q8enc[i] != 0) {
-                            allZero = false;
-                            break;
-                        }
-                    }
-                    if (allZero)
-                        throw new IllegalArgumentException("Peer message reduces to identity after unmasking (8*Q == 0).");
-                }
-            } finally {
-                Arrays.fill(q8enc, (byte) 0);
-            }
-            cafe.cryptography.curve25519.Scalar nativePrivateScalar =
-                    cafe.cryptography.curve25519.Scalar.fromBits(this.privateKey);
-            dhShared = nativeQExt.multiply(nativePrivateScalar).compress().toByteArray();
+            // AOSP/BoringSSL do not reject the identity-after-unmasking case;
+            // the derived transcript hash is the compatibility surface here.
+            dhShared = multiplyByRawScalar(nativeQExt, this.privateKey).compress().toByteArray();
             MessageDigest sha = newSha512Digest();
             if (this.myRole == Spake2Role.Alice) {
                 updateWithLengthPrefix(sha, this.myName, this.myName.length);
                 updateWithLengthPrefix(sha, this.theirName, this.theirName.length);
                 updateWithLengthPrefix(sha, this.myMsg, this.myMsg.length);
-                updateWithLengthPrefix(sha, theirMsg, MAX_MSG_SIZE);
+                updateWithLengthPrefix(sha, peerMsg, MAX_MSG_SIZE);
             } else {
                 updateWithLengthPrefix(sha, this.theirName, this.theirName.length);
                 updateWithLengthPrefix(sha, this.myName, this.myName.length);
-                updateWithLengthPrefix(sha, theirMsg, MAX_MSG_SIZE);
+                updateWithLengthPrefix(sha, peerMsg, MAX_MSG_SIZE);
                 updateWithLengthPrefix(sha, this.myMsg, this.myMsg.length);
             }
             updateWithLengthPrefix(sha, dhShared, dhShared.length);
@@ -387,6 +459,9 @@ public class Spake2Context implements Destroyable, AutoCloseable {
         } finally {
             if (dhShared != null) {
                 Arrays.fill(dhShared, (byte) 0);
+            }
+            if (peerMsg != null) {
+                Arrays.fill(peerMsg, (byte) 0);
             }
             wipeSensitiveState();
             if (!success) {
@@ -431,7 +506,7 @@ public class Spake2Context implements Destroyable, AutoCloseable {
             SecureRandom tmp;
             try {
                 tmp = SecureRandom.getInstanceStrong();
-            } catch (Throwable t) {
+            } catch (NoSuchAlgorithmException e) {
                 tmp = new SecureRandom();
             }
             INSTANCE = tmp;
