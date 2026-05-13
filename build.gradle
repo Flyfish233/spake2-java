@@ -11,13 +11,16 @@ plugins {
 }
 
 group = 'com.flyfish233'
-version = '1.0.5'
+version = '1.0.6'
 
 repositories {
     mavenCentral()
 }
 
 java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
     withJavadocJar()
     withSourcesJar()
 }
@@ -29,11 +32,11 @@ publishing {
 
             pom {
                 name = 'SPAKE2-Java'
-                description = 'Implementation of SPAKE2 protocol in Java, fully compatible with BoringSSL.'
+                description = 'ADB-focused SPAKE2-over-Edwards25519 core compatible with AOSP/BoringSSL pairing-auth semantics.'
                 url = 'https://github.com/flyfish233/spake2-java'
                 licenses {
                     license {
-                        name = 'GNU General Public License, Version 3.0 or later'
+                        name = 'GNU General Public License, Version 3.0'
                         url = 'https://www.gnu.org/licenses/gpl-3.0.txt'
                     }
                 }
@@ -49,9 +52,12 @@ dependencies {
 }
 
 tasks.withType(JavaCompile).configureEach {
+    options.release = 8
     options.compilerArgs.addAll(['-Xlint:unchecked', '-Xlint:deprecation'])
 }
 
 wrapper {
+    gradleVersion = '9.5.1'
     distributionType = Wrapper.DistributionType.ALL
+    distributionSha256Sum = 'c72fb9991f6025cbe337d52ba77e531b3faf62bdd3e348fe1ccee9f51c71adb0'
 }
