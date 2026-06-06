@@ -15,6 +15,8 @@ import cafe.cryptography.ed25519.Ed25519PublicKey;
 import cafe.cryptography.subtle.ConstantTime;
 
 import javax.security.auth.Destroyable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -500,16 +502,23 @@ public class Spake2Context implements Destroyable, AutoCloseable {
     }
 
     private static final class SecureRandomHolder {
-        private static final SecureRandom INSTANCE;
+        private static final String STRONG_RNG_FACTORY = "getInstanceStrong";
+        private static final SecureRandom INSTANCE = createDefaultSecureRandom();
 
-        static {
-            SecureRandom tmp;
+        private static SecureRandom createDefaultSecureRandom() {
             try {
-                tmp = SecureRandom.getInstanceStrong();
-            } catch (NoSuchAlgorithmException e) {
-                tmp = new SecureRandom();
+                // Android API 23 does not provide this factory. Reflection lets
+                // newer runtimes use it without linking the method on old devices.
+                Method factory = SecureRandom.class.getMethod(STRONG_RNG_FACTORY);
+                return (SecureRandom) factory.invoke(null);
+            } catch (NoSuchMethodException | IllegalAccessException | SecurityException | ClassCastException e) {
+                return new SecureRandom();
+            } catch (InvocationTargetException e) {
+                if (e.getCause() instanceof NoSuchAlgorithmException) {
+                    return new SecureRandom();
+                }
+                throw new IllegalStateException("Strong secure random factory failed.", e);
             }
-            INSTANCE = tmp;
         }
     }
 

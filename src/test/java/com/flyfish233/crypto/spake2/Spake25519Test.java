@@ -23,6 +23,7 @@ import java.nio.file.Paths;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -270,6 +271,119 @@ public class Spake25519Test {
         assertZeroField(ctx, "theirName");
     }
 
+    private static byte[] readClassResource(String resourceName) throws IOException {
+        try (InputStream in = Spake25519Test.class.getClassLoader().getResourceAsStream(resourceName)) {
+            assertNotNull(in);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            return out.toByteArray();
+        }
+    }
+
+    private static boolean constantPoolContainsMethodRef(
+            byte[] classFile, String owner, String name, String descriptor) {
+        if (readU4(classFile, 0) != 0xCAFEBABE) {
+            throw new IllegalArgumentException("Not a Java class file.");
+        }
+
+        int constantPoolCount = readU2(classFile, 8);
+        String[] utf8 = new String[constantPoolCount];
+        int[] classNameIndex = new int[constantPoolCount];
+        int[] refTag = new int[constantPoolCount];
+        int[] refClassIndex = new int[constantPoolCount];
+        int[] refNameAndTypeIndex = new int[constantPoolCount];
+        int[] nameAndTypeNameIndex = new int[constantPoolCount];
+        int[] nameAndTypeDescriptorIndex = new int[constantPoolCount];
+
+        int offset = 10;
+        for (int i = 1; i < constantPoolCount; i++) {
+            int tag = readU1(classFile, offset++);
+            switch (tag) {
+                case 1:
+                    int length = readU2(classFile, offset);
+                    offset += 2;
+                    utf8[i] = new String(classFile, offset, length, StandardCharsets.UTF_8);
+                    offset += length;
+                    break;
+                case 3:
+                case 4:
+                    offset += 4;
+                    break;
+                case 5:
+                case 6:
+                    offset += 8;
+                    i++;
+                    break;
+                case 7:
+                    classNameIndex[i] = readU2(classFile, offset);
+                    offset += 2;
+                    break;
+                case 8:
+                case 16:
+                case 19:
+                case 20:
+                    offset += 2;
+                    break;
+                case 9:
+                case 10:
+                case 11:
+                    refTag[i] = tag;
+                    refClassIndex[i] = readU2(classFile, offset);
+                    refNameAndTypeIndex[i] = readU2(classFile, offset + 2);
+                    offset += 4;
+                    break;
+                case 12:
+                    nameAndTypeNameIndex[i] = readU2(classFile, offset);
+                    nameAndTypeDescriptorIndex[i] = readU2(classFile, offset + 2);
+                    offset += 4;
+                    break;
+                case 15:
+                    offset += 3;
+                    break;
+                case 17:
+                case 18:
+                    offset += 4;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported constant-pool tag " + tag);
+            }
+        }
+
+        for (int i = 1; i < constantPoolCount; i++) {
+            if (refTag[i] != 10 && refTag[i] != 11) {
+                continue;
+            }
+            int classIndex = refClassIndex[i];
+            int nameAndTypeIndex = refNameAndTypeIndex[i];
+            if (classIndex == 0 || nameAndTypeIndex == 0) {
+                continue;
+            }
+            String refOwner = utf8[classNameIndex[classIndex]];
+            String refName = utf8[nameAndTypeNameIndex[nameAndTypeIndex]];
+            String refDescriptor = utf8[nameAndTypeDescriptorIndex[nameAndTypeIndex]];
+            if (owner.equals(refOwner) && name.equals(refName) && descriptor.equals(refDescriptor)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int readU1(byte[] bytes, int offset) {
+        return bytes[offset] & 0xFF;
+    }
+
+    private static int readU2(byte[] bytes, int offset) {
+        return ((bytes[offset] & 0xFF) << 8) | (bytes[offset + 1] & 0xFF);
+    }
+
+    private static int readU4(byte[] bytes, int offset) {
+        return (readU2(bytes, offset) << 16) | readU2(bytes, offset + 2);
+    }
+
     @Test
     public void scalarTestCmov() {
         Spake2Context.Scalar scalar = new Spake2Context.Scalar(HexUtils.hexToBytes(
@@ -320,6 +434,28 @@ public class Spake25519Test {
                 HexUtils.bytesToHex(eight.add(scalar).getBytes()));
         assertEquals("daa7ebb934c624b0ac39ef45bdf3bd2900000000000000000000000000000020",
                 HexUtils.bytesToHex(scalar.add(scalar).getBytes()));
+    }
+
+    @Test
+    public void defaultConstructorCanGenerateMessageWithPlatformRng() {
+        try (Spake2Context alice = new Spake2Context(
+                Spake2Role.Alice,
+                "alice".getBytes(StandardCharsets.UTF_8),
+                "bob".getBytes(StandardCharsets.UTF_8))) {
+            byte[] msg = alice.generateMessage("shared password".getBytes(StandardCharsets.UTF_8));
+            assertEquals(Spake2Context.MAX_MSG_SIZE, msg.length);
+        }
+    }
+
+    @Test
+    public void defaultPlatformRngUsesStrongFactoryWhenAvailable() throws Exception {
+        SecureRandom expected = SecureRandom.getInstanceStrong();
+        Class<?> holder = Class.forName("com.flyfish233.crypto.spake2.Spake2Context$SecureRandomHolder");
+        Method factory = holder.getDeclaredMethod("createDefaultSecureRandom");
+        factory.setAccessible(true);
+        SecureRandom actual = (SecureRandom) factory.invoke(null);
+        assertEquals(expected.getAlgorithm(), actual.getAlgorithm());
+        assertEquals(expected.getProvider().getName(), actual.getProvider().getName());
     }
 
     @Test
@@ -455,6 +591,27 @@ public class Spake25519Test {
         assertFalse(source.contains("Ed25519PrivateKey"));
         assertFalse(source.contains("Ed25519Signature"));
         assertFalse(source.contains(".sign("));
+    }
+
+    @Test
+    public void productionCodeDoesNotDirectlyLinkAndroid26SecureRandomFactory() throws Exception {
+        String forbidden = new StringBuilder("getInstance").append("Strong").toString();
+        byte[] holderClass = readClassResource(
+                "com/flyfish233/crypto/spake2/Spake2Context$SecureRandomHolder.class");
+        String classBytes = new String(holderClass, StandardCharsets.ISO_8859_1);
+        assertTrue(classBytes.contains(forbidden)); // Reflection can use the strong factory on newer runtimes.
+        assertTrue(constantPoolContainsMethodRef(holderClass,
+                "java/lang/Class",
+                "getMethod",
+                "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"));
+        assertTrue(constantPoolContainsMethodRef(holderClass,
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"));
+        assertFalse(constantPoolContainsMethodRef(holderClass,
+                "java/security/SecureRandom",
+                "getInstanceStrong",
+                "()Ljava/security/SecureRandom;"));
     }
 
     @Test
