@@ -24,7 +24,9 @@ The surrounding ADB client remains responsible for:
 
 ## Compatibility
 
-The supported product scope is ADB wireless debugging pairing used by `Kadb` only. IT DO NOT GRANTEE THE COMPATIBILITY OF ANY OTHER PURPOSES.
+The supported product scope is ADB wireless debugging pairing used by `Kadb` only. It does not guarantee compatibility for any other purpose.
+
+The default random-number generator path uses `SecureRandom.getInstanceStrong()` through reflection when the runtime provides it. On Android API 23-25 it falls back to `new SecureRandom()` to avoid direct linkage to APIs added after the supported minimum Android runtime.
 
 For ADB pairing, participant names include a trailing NUL byte:
 
